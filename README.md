@@ -21,7 +21,7 @@ This assumes that you already have ssh key pairs configured.
 If you are using the check_nrpe method, you will need a section in the services.cfg file on the nagios server that looks similar to the following.
 This assumes that you already have ssh key pairs configured.
 
-   define service{
+    define service{
            use                             generic-24x7-service
            host_name                       unix11
            service_description             Disk /var/log free space check
