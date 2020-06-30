@@ -1,0 +1,834 @@
+#!/usr/bin/perl -w
+
+
+# OUTSTANDING TASKS
+# -----------------
+#  1) not tested on Linux systems that do not use LVM
+#  2) not tested on SunOS (UFS,VxFs,ZFS)
+#  3) not tested on HP-UX
+#  4) not tested on FreeBSD or Linux with ZFS (need to use zfs list fsname instead of df -k fsname)
+
+
+#
+# Nagios plugin for detecting disk space usage on most UNIX-like operating systems
+#
+# Note that there are a fair number of contortions to go
+# through in order to get perl to work if it is invoked
+# by a setgid daemon.  Guess what's invoking this script?
+# Sigh.
+#
+
+
+# CHANGE LOG
+# ---------- 
+#  2009-01-17	Nick Jeffrey	Script created
+#  2010-04-15	Nick Jeffrey	Add FreeBSD, NetBSD, OpenBSD, Linux compatibility
+#  2010-04-15	Nick Jeffrey	Add placeholders for SunOS, HP-UX
+#  2010-04-15	Nick Jeffrey	Break code into subroutines
+#  2011-08-31	Nick Jeffrey	Convert % free thresholds into bytes free thresholds for consistency
+#  2011-08-31	Nick Jeffrey	Add $verbose for debugging
+#  2011-09-01	Nick Jeffrey	If no units are included for alerting thresholds, assume %
+#  2011-09-01	Nick Jeffrey	Allow decimals in thresholds (ie 7.5%, 1.5G, etc)
+#  2011-09-09	Nick Jeffrey	Bug fix - thresholds specified without units not defaulting to percent
+#  2011-09-09	Nick Jeffrey	Display output in both % and GB
+#  2011-09-16	Nick Jeffrey	Fix bug in ouput if user specified 0 for threshold
+#  2012-12-25   Nick Jeffrey    Add nagios perfdata to output
+#  2015-03-08   Nick Jeffrey    Add support for Mac OSX (tested on Yosemite)
+#  2018-01-15   Nick Jeffrey    Truncate $used_size to 2 decimal places
+#  2018-07-09   Nick Jeffrey    Bug fix - remove % from thresholds in performance data in print_output subroutine
+
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking free space in filesystem
+#   # If no thresholds are specified, default to warn=10% critical=5%
+#   # Thresholds may be defined in %,K,M,G,P (or combinations thereof)
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       nalunix11
+#           service_description             Disk /s00/samba free space check
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_aix_disk_space --warn=10 --critical=5 /s00/samba"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       nalunix11
+#           service_description             Disk /s00/samba free space check
+#           check_command                   check_nrpe!disk_/usr/sys/inst.images -t 30
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[disk_/s00/samba]=/usr/local/nagios/libexec/check_aix_disk_space --warn=10 --critical=5 /s00/samba
+#
+# Why do we use "df -k" instead of "df -h"?  Because we want this script to be portable
+# across UNIX flavors, and the AIX version of df does not support the -h switch.  However, 
+# the -k switch is pretty much universal across all popular UNIX-like operating systems.
+#
+#
+# Sample df -k output from AIX
+# ----------------------------
+# Filesystem    1024-blocks      Free %Used    Iused %Iused Mounted on
+# /dev/hd4            65536     15692   77%     1822    33% /
+# /dev/hd2          2048000    211700   90%    38124    42% /usr
+# /dev/hd9var         65536      5096   93%     1953    62% /var
+# /dev/hd3           131072    123852    6%       97     1% /tmp
+# /dev/hd1           262144     81008   70%     6400    22% /home
+# /proc                   -         -    -         -     -  /proc
+# /dev/hd10opt       524288    314296   41%     7974    11% /opt
+# wpg1dnim001:/nim/mksysb2/wpg1dvio002    33423360  17932932   47%       22     1% /mnt
+#
+#
+# 
+# Sample df -k output from FreeBSD / OpenBSD / NetBSD with UFS filesystems
+# ------------------------------------------------------------------------
+# Filesystem  1K-blocks        Used     Avail Capacity  Mounted on
+# /dev/ad2s1a    1012974      37346    894592     4%    /
+# devfs                1          1         0   100%    /dev
+# /dev/ad2s1g 1371041242 1071845918 189512026    85%    /backups
+# /dev/ad2s1e    2026030       4414   1859534     0%    /tmp
+# /dev/ad2s1f   20308398    5669726  13014002    30%    /usr
+# /dev/ad2s1d    2026030     856278   1007670    46%    /var
+# devfs                1          1         0   100%    /var/named/dev
+#
+#
+# 
+# Sample df -k output from Mac OSX
+# --------------------------------
+# Filesystem    1024-blocks      Used Available Capacity  iused    ifree %iused  Mounted on
+# /dev/disk0s2    311731616 204303024 107172592    66% 51139754 26793148   66%   /
+# devfs                 181       181         0   100%      629        0  100%   /dev
+# map -hosts              0         0         0   100%        0        0  100%   /net
+# map auto_home           0         0         0   100%        0        0  100%   /home
+#
+#
+# 
+# Sample df -k output from Linux using LVM
+# ----------------------------------------
+# Filesystem           1K-blocks      Used Available Use% Mounted on
+# /dev/mapper/VolGroup00-LogVol00
+#                       15109112   1652864  12676372  12% /
+# /dev/sda1               101086     18262     77605  20% /boot
+# tmpfs                   257664         0    257664   0% /dev/shm
+#
+# 
+# Sample df -k output from VMWare ESXi 4.0
+# ----------------------------------------
+# # df
+# Filesystem           1k-blocks      Used Available Use% Mounted on
+# visorfs                 221112    187716     33396  85% /
+# vmfs3                971505664 336969728  634535936  35% /vmfs/volumes/4a9978e4-cb16ea90-8c13-001cc0e9a2f5
+# vmfs3                976486400 230408192  746078208  24% /vmfs/volumes/4a997b24-f97153e8-3e03-001cc0e9a2f5
+# vfat                    292752    235728     57024  81% /vmfs/volumes/c2a427e4-2d317086-fef9-b5750d88536c
+# vfat                    255716     60716    195000  24% /vmfs/volumes/b7857b7b-b1209ad5-78e9-a45c711ced1b
+# vfat                   4192960       384   4192576   0% /vmfs/volumes/4a9978e2-30e01ae8-32e2-001cc0e9a2f5
+# vfat                    255716         4    255712   0% /vmfs/volumes/64a3807f-abc8afea-ed4f-39818539c696
+#
+#
+# 
+# Sample df -k output from Solaris 10 with ZFS filesystems
+# --------------------------------------------------------
+# $ df -k
+# Filesystem           1K-blocks      Used Available Use% Mounted on
+# rpool/ROOT/opensolaris
+#                        7883170   3507842   4375328  45% /
+# swap                    485932       308    485624   1% /etc/svc/volatile
+# /usr/lib/libc/libc_hwcap1.so.1
+#                        7883170   3507842   4375328  45% /lib/libc.so.1
+# swap                    485632         8    485624   1% /tmp
+# swap                    485688        64    485624   1% /var/run
+# rpool/export           4375350        22   4375328   1% /export
+# rpool/export/home      4375351        23   4375328   1% /export/home
+# rpool/export/home/njeffrey
+#                        4376200       872   4375328   1% /export/home/njeffrey
+# rpool                  4375408        80   4375328   1% /rpool
+# /dev/dsk/c4t0d0s2       663066    663066         0 100% /media/OpenSolaris
+# /export/home/njeffrey
+#                        4376200       872   4375328   1% /home/njeffrey
+
+
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;			#allow --long-switches to be used as parameters
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($df,$CHECK_NAME,$default_warn_threshold,$default_critical_threshold);
+my ($warn_threshold_pct,$warn_threshold_bytes,$critical_threshold_pct,$critical_threshold_bytes);
+my ($total_size_bytes,$free_size_bytes,$warn_threshold,$critical_threshold,$pct_used,$pct_free);
+my ($filesystem,$inodes,$pct_inodes,$nagios_return_code,$uname);
+my ($opt_h,$opt_w,$opt_c);
+my ($os,$size_descriptor,$total_size_descriptor,$used_size_descriptor,$free_size_descriptor);
+my ($warn_threshold_descriptor,$critical_threshold_descriptor,$total_size,$free_size,$used_size);
+my ($verbose,$common_output_data,$warn_output_data,$crit_output_data,$perf_data);
+
+$CHECK_NAME                 = "filesystem space";
+$default_warn_threshold     = "10%";			#if no parameter supplied, set default warn     level to 10% free space
+$default_critical_threshold = "5%";	 		#if no parameter supplied, set default critical level to 5% free space		
+$verbose                    = "no";			#yes/no variable to increase output for debugging
+$common_output_data         = "";			#initialize variable
+$warn_output_data           = "";			#initialize variable
+$crit_output_data           = "";			#initialize variable
+$perf_data                  = "";
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"       => \$opt_h,
+      "w=s" => \$opt_w, "warning=s"  => \$opt_w, "warn=s" => \$opt_w,
+      "c=s" => \$opt_c, "critical=s" => \$opt_c, "crit=s" => \$opt_c,
+   );
+   #
+   # If the user did not supply a --warn= threshold, use the default.
+   #
+   if( defined( $opt_w ) ) {
+      $warn_threshold = $opt_w;
+   } else {
+      $warn_threshold = $default_warn_threshold;
+   }
+   #
+   # If the user did not supply a --critical= threshold, use the default.
+   #
+   if( defined( $opt_c ) ) {
+      $critical_threshold = $opt_c;
+   } else {
+      $critical_threshold = $default_critical_threshold;
+   }
+}			#end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # figure out where the df command is on this system (varies across UNIX flavors)
+   $df = "/bin/df"      if ( -e "/bin/df" );
+   $df = "/usr/bin/df"  if ( -e "/usr/bin/df" );
+   $df = "/usr/sbin/df" if ( -e "/usr/sbin/df" );
+   $df = "/sbin/df"     if ( -e "/sbin/df" );
+   #
+   #
+   # figure out where the uname command is on this system (varies across UNIX flavors)
+   $uname = "/bin/uname"      if ( -e "/bin/uname" );
+   $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname" );
+   $uname = "/usr/sbin/uname" if ( -e "/usr/sbin/uname" );
+   $uname = "/sbin/uname"     if ( -e "/sbin/uname" );
+   #
+   # see if user is asking for help
+   &get_usage if ( defined($opt_h) );	#jump to get_usage subroutine if user provides -h or --help parameters
+   #
+   # confirm a filesystem was supplied as a parameter
+   #
+   if( ! defined( $ARGV[0] ) ) {
+      print "$CHECK_NAME Unknown - missing name of filesystem to check.  Use $0 -h for help\n";
+      exit $UNKNOWN;					#exit script
+   }
+   #
+   # confirm filesystem contains valid characters
+   $filesystem = $ARGV[0];
+   unless( $filesystem =~ /^([-_\w\d%\/\.]+)$/ ) {	#filesystem name may contain: letters numbers / - _ .
+      print "$CHECK_NAME Unknown - Bad filesystem name $filesystem \n";
+      exit $UNKNOWN;					#exit script
+   }							#end of if/elsif/else block
+}							#end of subroutine
+
+
+
+
+
+
+sub get_usage {
+   #
+   # this subroutine gets called if user enters -h or --help parameters
+   #
+   #
+   print "running get_usage subroutine \n" if ($verbose eq "yes");
+   #
+   if( $opt_h ) {
+      print "Nagios plugin for determining filesystem usage. \n";
+      print "$0 [options] filesystem \n";
+      print "    where options are: \n";
+      print "    -w=warn_rate \n";
+      print "    --warn=warn_rate             Warning threshold in % \n";
+      print "                                (Default value = $default_warn_threshold ) \n";
+      print "    -c=critical_rate \n";
+      print "    --critical=critical_rate     Critical threshold in % \n";
+      print "                                (Default value = $default_critical_threshold ) \n";
+      print "    You may also specify warn and critical in K/M/G/T/P \n";
+      print "    Examples:    \n";
+      print "       $0 --warn=100M /var \n";
+      print "       $0 --warn=10G --critical=5G /usr \n";
+      print "       $0 --warn=10  --critical=5 /usr \n";
+      print "       $0 -w 10  -c 5 /usr \n";
+      print "\n\n";
+      exit;
+   }						#end of if block
+}
+
+
+
+
+
+
+
+sub get_filesystem_size {
+   #
+   # figure out what operating system we are dealing with
+   #
+   #
+   print "running get_filesystem_data subroutine \n" if ($verbose eq "yes");
+   #
+   $os = `$uname`;					#figure out what operating system we are running
+   chomp $os;						#remove newline
+   #
+   if ( $os eq "SunOS" ) {
+      print "detected operating system = $os \n" if ($verbose eq "yes");
+      open (IN,"$df -k $filesystem |");                 #open filehandle using command output
+      while (<IN>) {       	                        #read a line from filehandle
+         next if ( /^Filesystem/ );			#skip header line
+         next unless ( /$filesystem/ );			#skip lines that do not contain filesystem name
+         if ( /([a-zA-Z0-9\/\.]+) +([0-9]+) +([0-9]+) +([0-9]+) +([0-9\%]+) +$filesystem/ ) {
+            $total_size_bytes = $2 * 1024;		#convert to bytes
+            $free_size_bytes  = $4 * 1024;		#convert to bytes 
+            $inodes     = 0;				#FreeBSD df does not show inodes
+            $pct_inodes = 0;				#FreeBSD df does not show inodes
+         }						#end of if block
+      }							#end of while loop
+      close IN;   					#close filehandle 
+   #
+   } elsif ( $os eq "HP-UX" ) {   
+      #
+      # NOTE: hpux has both "df" and "bdf".  The bdf (Berkeley df) is superior, but we will use df just
+      #       for consistency with the rest of the UNIX flavors
+      print "Detected operating system:$os \n" if ($verbose eq "yes");
+      print "$CHECK_NAME Unknown - $os is not yet supported by this check.  Please add support for $os if you have the skills. \n";
+      exit( $UNKNOWN );
+   #
+   } elsif ( $os eq "FreeBSD" || $os eq "OpenBSD" || $os eq "NetBSD" ) {
+      print "Detected operating system:$os \n" if ($verbose eq "yes");
+      open (IN,"$df -k $filesystem |");                 #open filehandle using command output
+      while (<IN>) {       	                        #read a line from filehandle
+         next if ( /^Filesystem/ );			#skip header line
+         next unless ( /$filesystem/ );			#skip lines that do not contain filesystem name
+         if ( /([a-zA-Z0-9\/]+) +([0-9]+) +([0-9]+) +([0-9]+) +([0-9\%]+) +$filesystem/ ) {
+            $total_size_bytes = $2 * 1024;		#convert to bytes
+            $free_size_bytes  = $4 * 1024;		#convert to bytes 
+            $inodes     = 0;				#FreeBSD df does not show inodes
+            $pct_inodes = 0;				#FreeBSD df does not show inodes
+         }						#end of if block
+      }							#end of while loop
+      close IN;   					#close filehandle 
+   #
+   } elsif ( $os eq "VMKernel" ) {   
+      # It should be possible to support both ESX (with Linux service console) 
+      # However, since ESXi (with busybox console) does not have a perl interpreter, 
+      # there is no way to run this perl script.
+      # Perhaps you can figure out a way to differentiate between ESX and ESXi
+      print "Detected operating system:$os \n" if ($verbose eq "yes");
+      print "$CHECK_NAME Unknown - $os is not yet supported by this check.  Please add support for $os if you have the skills. \n";
+      exit( $UNKNOWN );
+   #
+   } elsif ( $os eq "Linux" ) {   
+      print "Detected operating system:$os \n" if ($verbose eq "yes");
+      open (IN,"$df -k $filesystem |");                 #open filehandle using command output
+      while (<IN>) {                   		        #read a line from filehandle
+         next if ( /^Filesystem/ );			#skip header line
+         next unless ( /$filesystem/ );			#skip lines that do not contain filesystem name
+         if ( / +([0-9]+) +([0-9]+) +([0-9]+) +([0-9\%]+) +$filesystem/ ) {
+            $total_size_bytes = $1 * 1024;		#convert to bytes
+            $free_size_bytes  = $3 * 1024;		#convert to bytes
+            $inodes     = 0;				#Linux df does not show inodes
+            $pct_inodes = 0;				#Linux df does not show inodes
+         }						#end of if block
+      }							#end of while loop
+      close IN;    					#close filehandle
+   #
+   } elsif ( $os eq "AIX" ) {   
+      print "Detected operating system:$os \n" if ($verbose eq "yes");
+      open (IN,"$df -k $filesystem |");                 #open filehandle using command output
+      while (<IN>) {                               	#read a line from filehandle
+         next if ( /^Filesystem/ );			#skip header line
+         next unless ( /$filesystem/ );			#skip lines that do not contain filesystem name
+         if ( /([a-zA-Z0-9\/]+) +([0-9]+) +([0-9]+) +([0-9\%]+) +([0-9]+) +([0-9\%]+) +$filesystem/ ) {
+            $total_size_bytes = $2 * 1024;		#convert to bytes
+            $free_size_bytes  = $3 * 1024;		#convert to bytes
+            $inodes     = $5;				#AIX df does show inodes
+            $pct_inodes = $6;				#AIX df does show inodes
+         }						#end of if block
+      }							#end of while loop
+      close IN;   					#close filehandle 
+   #
+   } elsif ( $os eq "Darwin" ) {    			#Darwin is the core of Mac OSx
+      print "Detected operating system:$os \n" if ($verbose eq "yes");
+      open (IN,"$df -k $filesystem |");                 #open filehandle using command output
+      while (<IN>) {                               	#read a line from filehandle
+         next if ( /^Filesystem/ );			#skip header line
+         next unless ( /$filesystem/ );			#skip lines that do not contain filesystem name
+         if ( /([a-zA-Z0-9\/]+) +([0-9]+) +([0-9]+) +([0-9]+) +([0-9\%]+) +([0-9]+) +([0-9]+) +([0-9\%]+) +$filesystem/ ) {
+            $total_size_bytes = $2 * 1024;		#convert to bytes
+            $free_size_bytes  = $4 * 1024;		#convert to bytes
+            $inodes     = $6+$7;			#add inodes used and inodes free to get total inodes
+            $pct_inodes = $8;				#MacOSX df does show inodes
+         }						#end of if block
+      }							#end of while loop
+      close IN;   					#close filehandle 
+   #
+   } else {							
+      #
+      # we only get this far if we are running on an unknown operating system
+      #
+      print "$CHECK_NAME Unknown - Could not determine operating system type: $os \n";
+      exit( $UNKNOWN );
+   }							#end of if/elsif/else block
+   #
+   # confirm we were able to get good data  
+   if( ! defined($total_size_bytes) || ! defined($free_size_bytes) ) {
+      print "$CHECK_NAME Unknown - Could not get size of $filesystem.  Please confirm this is a valid filesystem name \n";
+      exit( $UNKNOWN );
+   }						#end of if block
+   # 
+   # sanity check to make sure total size is larger than free size
+   #
+   if( $total_size_bytes < $free_size_bytes ) {
+      print "$CHECK_NAME Unknown - Inconceivable values. Total size ($total_size_bytes) < free space available ($free_size_bytes)\n";
+      exit( $UNKNOWN );
+   }
+   #
+   #
+   # figure out the percentage of used and free space in the filesystem
+   #
+   $pct_used= sprintf( "%.0f", ($total_size_bytes - $free_size_bytes) / $total_size_bytes * 100 );
+   $pct_free= 100 - $pct_used;
+
+}						#end of subroutine
+
+
+
+
+sub check_thresholds {
+   #
+   # We want to be able to display the output in both % free as well as KB/MB/GB/TB/PB free.
+   # Take whatever the user provides, and calculate the equivalent percentage or bytes free.
+   #
+   #
+   print "running check_thresholds subroutine \n" if ($verbose eq "yes");
+   #
+   # if the threshold does not have %/K/M/G/T/P specified, assume the value is in %
+   if ( $warn_threshold =~ /[0-9]+$/ ) {						#threshold was just a bare number - assume it was percent
+      print "Threshold parameter did not specify % K M G T P - assuming value is in percent \n" if ($verbose eq "yes");
+      $warn_threshold_pct   = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * $total_size_bytes / 100;			#convert percent to bytes
+      $warn_threshold_bytes = sprintf( "%.0f", $warn_threshold_bytes);			#get rid of any decimal places
+   }											#end of if block
+   #
+   # if the threshold is specified in percent, calculate the equivalent bytes
+   if ( $warn_threshold =~ /\%$/ ) {							#threshold was specified in percent
+      chop $warn_threshold;								#remove the final character
+      $warn_threshold_pct   = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * $total_size_bytes / 100;			#convert percent to bytes
+      $warn_threshold_bytes = sprintf( "%.0f", $warn_threshold_bytes);			#get rid of any decimal places
+   }											#end of if block
+   #
+   # if the threshold is specified in Kilobytes, calculate the equivalent percent and bytes
+   if ( $warn_threshold =~ /K$/i ) {							#threshold was specified in KB 
+      chop $warn_threshold;								#remove the final character
+      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * 1024;					#convert KB to bytes
+      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert KB to %
+      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
+   }											#end of if block
+   #
+   # if the threshold is specified in Megabytes, calculate the equivalent percent
+   if ( $warn_threshold =~ /M$/i ) {							#threshold was specified in MB 
+      chop $warn_threshold;								#remove the final character
+      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * 1024 * 1024;				#convert MB to bytes
+      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert GB to %
+      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
+   }											#end of if block
+   #
+   # if the threshold is specified in Gigabytes, calculate the equivalent percent and bytes
+   if ( $warn_threshold =~ /G$/i ) {							#threshold was specified in GB 
+      chop $warn_threshold;								#remove the final character
+      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * 1024 * 1024 * 1024;			#convert GB to bytes
+      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert GB to %
+      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
+   }											#end of if block
+   #
+   # if the threshold is specified in Terabytes, calculate the equivalent percent and bytes
+   if ( $warn_threshold =~ /P$/i ) {							#threshold was specified in TB 
+      chop $warn_threshold;								#remove the final character
+      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * 1024 * 1024 * 1024 * 1024;		#convert TB to bytes
+      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert TB to %
+      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
+   }											#end of if block
+   #
+   # if the threshold is specified in Petabytes, calculate the equivalent percent and bytes
+   if ( $warn_threshold =~ /P$/i ) {							#threshold was specified in PB 
+      chop $warn_threshold;								#remove the final character
+      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
+      $warn_threshold_bytes = $warn_threshold * 1024 * 1024 * 1024 * 1024 * 1024;	#convert PB to bytes
+      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert PB to %
+      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
+   }											#end of if block
+   #
+   # now that we are certain the threshold is in %, confirm it is between 1-100.
+   #
+   if( $warn_threshold_pct < 0 || $warn_threshold_pct > 100 ) {
+       print "$CHECK_NAME Unknown - Warn threshold must be between 0 - 100 when specified in percent\n";
+       exit( $UNKNOWN );
+   }
+   print "warn_threshold_bytes = $warn_threshold_bytes \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   #
+   #
+   #
+   # if the threshold does not have %/K/M/G/T/P specified, assume the value is in %
+   if ( $critical_threshold =~ /[0-9]+$/ ) {						#threshold was just a bare number - assume it was percent
+      print "Threshold parameter did not specify % K M G T P - assuming value is in percent \n" if ($verbose eq "yes");
+      $critical_threshold_pct   = $critical_threshold;					#save to new variable after removing final character
+      $critical_threshold_bytes = $critical_threshold * $total_size_bytes / 100;	#convert percent to bytes 
+      $critical_threshold_bytes = sprintf( "%.0f", $critical_threshold_bytes);		#get rid of any decimal places 
+   }											#end of if block 
+   # if the threshold is specified in percent, calculate the equivalent bytes 
+   if ( $critical_threshold =~ /\%$/ ) {                                    		#threshold was specified in percent 
+      chop $critical_threshold;								#remove the final character 
+      $critical_threshold_pct   = $critical_threshold;					#save to new variable after removing final character 
+      $critical_threshold_bytes = $critical_threshold * $total_size_bytes / 100;      	#convert percent to bytes 
+      $critical_threshold_bytes = sprintf( "%.0f", $critical_threshold_bytes);  	#get rid of any decimal places 
+   }                                                                    		#end of if block
+   #
+   # if the threshold is specified in Kilobytes, calculate the equivalent percent and bytes
+   if ( $critical_threshold =~ /K$/i ) {                                    		#threshold was specified in KB
+      chop $critical_threshold;								#remove the final character
+      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
+      $critical_threshold_bytes = $critical_threshold * 1024;				#convert KB to bytes
+      $critical_threshold_pct   = $critical_threshold_bytes / $total_size_bytes * 100; 	#convert KB to %
+      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
+   }                                                                    		#end of if block
+   #
+   # if the threshold is specified in Megabytes, calculate the equivalent percent and bytes
+   if ( $critical_threshold =~ /M$/i ) {                                    		#threshold was specified in MB
+      chop $critical_threshold;								#remove the final character
+      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
+      $critical_threshold_bytes = $critical_threshold * 1024 * 1024;                 	#convert MB to bytes
+      $critical_threshold_pct = $critical_threshold_bytes / $total_size_bytes * 100;   	#convert MB to %
+      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
+   }                                                                    		#end of if block
+   #
+   # if the threshold is specified in Gigabytes, calculate the equivalent percent and bytes
+   if ( $critical_threshold =~ /G$/i ) {                                    		#threshold was specified in GB
+      chop $critical_threshold;								#remove the final character
+      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
+      $critical_threshold_bytes = $critical_threshold * 1024 * 1024 * 1024;           	#convert GB to bytes
+      $critical_threshold_pct   = $critical_threshold_bytes / $total_size_bytes * 100; 	#convert GB to %
+      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
+   }                                                                    		#end of if block
+   #
+   # if the threshold is specified in Terabytes, calculate the equivalent percent and bytes
+   if ( $critical_threshold =~ /P$/i ) {                                    		#threshold was specified in TB
+      chop $critical_threshold;								#remove the final character
+      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
+      $critical_threshold_bytes = $critical_threshold * 1024 * 1024 * 1024 * 1024;	#convert TB to bytes
+      $critical_threshold_pct   = $critical_threshold / $total_size_bytes * 100;       	#convert TB to %
+      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
+   }                                                                    		#end of if block
+   #
+   # if the threshold is specified in Petabytes, calculate the equivalent percent and bytes
+   if ( $critical_threshold =~ /P$/i ) {                                    		#threshold was specified in PB
+      chop $critical_threshold;								#remove the final character
+      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
+      $critical_threshold_bytes = $critical_threshold * 1024 * 1024 * 1024 * 1024 * 1024;	#convert PB to bytes
+      $critical_threshold_pct   = $critical_threshold / $total_size_bytes * 100;       	#convert PB to %
+      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
+   }                                                                    		#end of if block
+   #
+   # now that we are certain the threshold is in %, confirm it is between 1-100.
+   #
+   if( $critical_threshold_pct < 0 || $critical_threshold_pct > 100 ) {
+       print "$CHECK_NAME Unknown - critical threshold must be between 0 - 100 when specified in percent\n";
+       exit( $UNKNOWN );
+   }
+   #
+   #
+   # sanity check to confirm the critical threshold is a smaller value than the warning threshold
+   #
+   if( $warn_threshold_bytes <= $critical_threshold_bytes ) {
+      print "$CHECK_NAME Unknown - Warning threshold $warn_threshold_pct% must be larger than Critical threshold $critical_threshold_pct%.  Please correct.\n";
+      exit( $UNKNOWN );
+   }
+   print "critical_threshold_bytes = $critical_threshold_bytes \n" if ($verbose eq "yes");
+}					#end of subroutine
+
+
+
+
+
+
+
+sub format_output {
+   #
+   # this subroutine takes the bytes of warning/critical thresholds, free/used space, and converts from bytes
+   # to more meaningful KB/MB/GB/TB/PB
+   #
+   #
+   print "running format_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # Convert bytes of warning/critical thresholds to KB/MB/GB/TB/PB
+   #
+   if    ( $warn_threshold_bytes >= 1000000000000000 ){
+      $warn_threshold_descriptor = "PB";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $warn_threshold_bytes >= 1000000000000 ){
+      $warn_threshold_descriptor = "TB";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $warn_threshold_bytes >= 1000000000 ){
+      $warn_threshold_descriptor = "GB";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $warn_threshold_bytes >= 1000000 ){
+      $warn_threshold_descriptor  = "MB";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 );
+   }
+   #
+   elsif ( $warn_threshold_bytes >= 1000 ){
+      $warn_threshold_descriptor = "KB";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 );
+   }
+   #
+   elsif ( $warn_threshold_bytes >= 1 ){
+      $warn_threshold_descriptor = "B";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1 );
+   }
+   #
+   elsif ( $warn_threshold_bytes >= 0 ){  #just in case someone sets the threshold to zero
+      $warn_threshold_descriptor = "B";
+      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1 );
+   }
+   #
+   else {
+      print "$CHECK_NAME Unknown - could not determine size of warning threshold ";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   #
+   if    ( $critical_threshold_bytes >= 1000000000000000 ){
+      $critical_threshold_descriptor = "PB";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $critical_threshold_bytes >= 1000000000000 ){
+      $critical_threshold_descriptor = "TB";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $critical_threshold_bytes >= 1000000000 ){
+      $critical_threshold_descriptor = "GB";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $critical_threshold_bytes >= 1000000 ){
+      $critical_threshold_descriptor = "MB";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 );
+   }
+   #
+   elsif ( $critical_threshold_bytes >= 1000 ){
+      $critical_threshold_descriptor = "KB";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 );
+   }
+   #
+   elsif ( $critical_threshold_bytes >= 1 ){
+      $critical_threshold_descriptor = "B";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1 );
+   }
+   #
+   elsif ( $critical_threshold_bytes >= 0 ){  #just in case someone sets the threshold to zero
+      $critical_threshold_descriptor = "B";
+      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1 );
+   }
+   #
+   else {
+      print "$CHECK_NAME Unknown - could not determine size of critical threshold ";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   #
+   #
+   #
+   #
+   # Convert bytes of total/free/used space to KB/MB/GB/TB/PB
+   #
+   if    ( $total_size_bytes >= 1000000000000000 ){
+      $size_descriptor       = "PB";
+      $total_size = sprintf( "%.2f", $total_size_bytes / 1024 / 1024 / 1024 / 1024 / 1024 );
+      $free_size  = sprintf( "%.2f", $free_size_bytes  / 1024 / 1024 / 1024 / 1024 / 1024 );
+      $used_size  = sprintf( "%.2f", $total_size - $free_size );
+   }
+   elsif ( $total_size_bytes >= 1000000000000 ){
+      $size_descriptor       = "TB";
+      $total_size = sprintf( "%.2f", $total_size_bytes / 1024 / 1024 / 1024 / 1024 );
+      $free_size  = sprintf( "%.2f", $free_size_bytes  / 1024 / 1024 / 1024 / 1024 );
+      $used_size  = sprintf( "%.2f", $total_size - $free_size );
+   }
+   elsif ( $total_size_bytes >= 1000000000 ){
+      $size_descriptor       = "GB";
+      $total_size = sprintf( "%.2f", $total_size_bytes / 1024 / 1024 / 1024 );
+      $free_size  = sprintf( "%.2f", $free_size_bytes  / 1024 / 1024 / 1024 );
+      $used_size  = sprintf( "%.2f", $total_size - $free_size );
+   }
+   elsif ( $total_size_bytes >= 1000000 ){
+      $size_descriptor       = "MB";
+      $total_size = sprintf( "%.2f", $total_size_bytes / 1024 / 1024 );
+      $free_size  = sprintf( "%.2f", $free_size_bytes  / 1024 / 1024 );
+      $used_size  = sprintf( "%.2f", $total_size - $free_size );
+   }
+   elsif ( $total_size_bytes >= 1000 ){
+      $size_descriptor       = "KB";
+      $total_size = sprintf( "%.2f", $total_size_bytes / 1024 );
+      $free_size  = sprintf( "%.2f", $free_size_bytes  / 1024 );
+      $used_size  = sprintf( "%.2f", $total_size - $free_size );
+   }
+   elsif ( $total_size_bytes >= 1 ){
+      $size_descriptor       = "B";
+      $total_size = sprintf( "%.2f", $total_size_bytes / 1 );
+      $free_size  = sprintf( "%.2f", $free_size_bytes  / 1 );
+      $used_size  = sprintf( "%.2f", $total_size - $free_size );
+   }
+   else {
+      print "$CHECK_NAME Unknown - could not determine size of filesystem ";
+      exit $UNKNOWN;
+   }					#end of if/elsif/else block
+}
+
+
+
+
+
+
+
+sub print_output {
+   #
+   # this subroutine prints out the results of the nagios check
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   $perf_data = "total_size=${total_size}${size_descriptor} used_size=${used_size}${size_descriptor};;;; free_size=${free_size}${size_descriptor};;;; pct_free=${pct_free}%;${warn_threshold_pct};${critical_threshold_pct};0;100  ";
+   #
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   $common_output_data = "$filesystem has ${free_size}${size_descriptor} (${pct_free}%) free space.  Total=${total_size}${size_descriptor} Used=${used_size}${size_descriptor} Free=${free_size}${size_descriptor} Warn at ${warn_threshold}${warn_threshold_descriptor} (${warn_threshold_pct}%) free, critical at ${critical_threshold}${critical_threshold_descriptor} (${critical_threshold_pct}%)";
+   #
+   #
+   # We shouldn't (famous last words) need to worry about inodes anymore.  In case we are are on an
+   # operating system that reports inode usage, add the inode details to the output.
+   #
+   if ( $inodes > 0 || $pct_inodes > 0 ) {
+      $common_output_data = "$common_output_data inodes=$inodes pct_inodes=$pct_inodes ";
+      $perf_data          = "$perf_data inodes=$inodes;;;; pct_inodes=$pct_inodes;90%;99%;0%;100% ";
+   }
+
+   #
+   if( $total_size_bytes == 0 ) {
+      print "$CHECK_NAME Unknown - $filesystem is a bad name or df can't find it";
+      exit $UNKNOWN;
+   }
+
+   if( $pct_free <= $critical_threshold_pct ) {
+      $crit_output_data = "Filesystem is critically low on free space.  Please free up space by deleting obsolete data or have the filesystem grown in size.  Please do not ignore this warning.  You will continue to receive this warning every day until the low disk space issue is addressed. ";
+      print "$CHECK_NAME CRITICAL -  $common_output_data $crit_output_data | $perf_data \n";
+      exit $CRITICAL;
+   }
+
+   if( $pct_free <= $warn_threshold_pct ) {
+      $warn_output_data = "Filesystem is getting low on free space.  Please free up space by deleting obsolete data or have the filesystem grown in size.  Please do not ignore this warning.  You will continue to receive this warning every day until the low disk space issue is addressed. ";
+      print "$CHECK_NAME WARN     - $common_output_data $warn_output_data | $perf_data \n";
+      exit $WARN;
+   }
+
+   if( $pct_free > $warn_threshold_pct ) {
+      print "$CHECK_NAME OK       - $common_output_data | $perf_data \n";
+      exit $OK;
+   }
+   #
+   # we should never get this far
+   print "$CHECK_NAME Unknown - Inconceivable! $filesystem has total size $total_size_bytes bytes and free space $free_size_bytes bytes   $common_output_data | $perf_data \n";
+   exit $UNKNOWN;
+}
+
+
+
+
+
+
+
+
+# -----------------------------------------------------------------
+#    main body of program 
+# -----------------------------------------------------------------
+get_options;	
+sanity_checks;
+get_usage;	
+get_filesystem_size; 
+check_thresholds;	
+format_output;
+print_output;	
+
+
