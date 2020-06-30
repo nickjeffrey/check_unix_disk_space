@@ -11,12 +11,6 @@
 
 #
 # Nagios plugin for detecting disk space usage on most UNIX-like operating systems
-#
-# Note that there are a fair number of contortions to go
-# through in order to get perl to work if it is invoked
-# by a setgid daemon.  Guess what's invoking this script?
-# Sigh.
-#
 
 
 # CHANGE LOG
