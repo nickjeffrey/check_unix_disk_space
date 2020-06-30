@@ -28,4 +28,5 @@ This assumes that you already have ssh key pairs configured.
            check_command                   check_nrpe!disk_/var/log -t 30
            }
   
-
+If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:  
+    `command[disk_/var/log]=/usr/local/nagios/libexec/check_unix_disk_space /var/log`
