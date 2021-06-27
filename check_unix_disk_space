@@ -53,7 +53,7 @@
 #   # Thresholds may be defined in %,K,M,G,P (or combinations thereof)
 #   define service{
 #           use                             generic-24x7-service
-#           host_name                       nalunix11
+#           host_name                       unix11
 #           service_description             Disk /s00/samba free space check
 #           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_aix_disk_space --warn=10 --critical=5 /s00/samba"
 #           }
@@ -63,7 +63,7 @@
 #  This assumes that you already have ssh key pairs configured.
 #   define service{
 #           use                             generic-24x7-service
-#           host_name                       nalunix11
+#           host_name                       unix11
 #           service_description             Disk /s00/samba free space check
 #           check_command                   check_nrpe!disk_/usr/sys/inst.images -t 30
 #           }
