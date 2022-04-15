@@ -6,30 +6,34 @@
 #  1) not tested on Linux systems that do not use LVM
 #  2) not tested on SunOS (UFS,VxFs,ZFS)
 #  3) not tested on HP-UX
-#  4) not tested on FreeBSD or Linux with ZFS (need to use zfs list fsname instead of df -k fsname)
+#  4) not tested on FreeBSD with ZFS
 
 
 #
 # Nagios plugin for detecting disk space usage on most UNIX-like operating systems
+#
 
 
 # CHANGE LOG
 # ---------- 
-#  2009-01-17	Nick Jeffrey	Script created
-#  2010-04-15	Nick Jeffrey	Add FreeBSD, NetBSD, OpenBSD, Linux compatibility
-#  2010-04-15	Nick Jeffrey	Add placeholders for SunOS, HP-UX
-#  2010-04-15	Nick Jeffrey	Break code into subroutines
-#  2011-08-31	Nick Jeffrey	Convert % free thresholds into bytes free thresholds for consistency
-#  2011-08-31	Nick Jeffrey	Add $verbose for debugging
-#  2011-09-01	Nick Jeffrey	If no units are included for alerting thresholds, assume %
-#  2011-09-01	Nick Jeffrey	Allow decimals in thresholds (ie 7.5%, 1.5G, etc)
-#  2011-09-09	Nick Jeffrey	Bug fix - thresholds specified without units not defaulting to percent
-#  2011-09-09	Nick Jeffrey	Display output in both % and GB
-#  2011-09-16	Nick Jeffrey	Fix bug in ouput if user specified 0 for threshold
-#  2012-12-25   Nick Jeffrey    Add nagios perfdata to output
-#  2015-03-08   Nick Jeffrey    Add support for Mac OSX (tested on Yosemite)
-#  2018-01-15   Nick Jeffrey    Truncate $used_size to 2 decimal places
-#  2018-07-09   Nick Jeffrey    Bug fix - remove % from thresholds in performance data in print_output subroutine
+#  2007-08-15	kkearney	Script created for AIX
+#  2009-01-17	njeffrey	Enhancements, add documentation
+#  2010-04-15	njeffrey	Add FreeBSD, NetBSD, OpenBSD, Linux compatibility
+#  2010-04-15	njeffrey	Add placeholders for SunOS, HP-UX
+#  2010-04-15	njeffrey	Break code into subroutines
+#  2011-08-31	njeffrey	Convert % free thresholds into bytes free thresholds for consistency
+#  2011-08-31	njeffrey	Add $verbose for debugging
+#  2011-09-01	njeffrey	If no units are included for alerting thresholds, assume %
+#  2011-09-01	njeffrey	Allow decimals in thresholds (ie 7.5%, 1.5G, etc)
+#  2011-09-09	njeffrey	Bug fix - thresholds specified without units not defaulting to percent
+#  2011-09-09	njeffrey	Display output in both % and GB
+#  2011-09-16	njeffrey	Fix bug in ouput if user specified 0 for threshold
+#  2012-12-25   njeffrey    	Add nagios perfdata to output
+#  2015-03-08   njeffrey    	Add support for Mac OSX (tested on Yosemite)
+#  2018-01-15   njeffrey    	Truncate $used_size to 2 decimal places
+#  2018-07-09   njeffrey    	Bug fix - remove % from thresholds in performance data in print_output subroutine
+#  2022-04-13   njeffrey    	Code refactoring
+#  2022-04-14   njeffrey    	Adjust perfdata output to include warn,crit thresholds to format expected by pnp4nagios graphing
 
 
 
@@ -51,9 +55,10 @@
 #   # Define service for checking free space in filesystem
 #   # If no thresholds are specified, default to warn=10% critical=5%
 #   # Thresholds may be defined in %,K,M,G,P (or combinations thereof)
+#   # If no unit of measurement is provided, % will be assumed
 #   define service{
 #           use                             generic-24x7-service
-#           host_name                       unix11
+#           host_name                       nalunix11
 #           service_description             Disk /s00/samba free space check
 #           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_aix_disk_space --warn=10 --critical=5 /s00/samba"
 #           }
@@ -63,7 +68,7 @@
 #  This assumes that you already have ssh key pairs configured.
 #   define service{
 #           use                             generic-24x7-service
-#           host_name                       unix11
+#           host_name                       nalunix11
 #           service_description             Disk /s00/samba free space check
 #           check_command                   check_nrpe!disk_/usr/sys/inst.images -t 30
 #           }
@@ -90,8 +95,8 @@
 #
 #
 # 
-# Sample df -k output from FreeBSD / OpenBSD / NetBSD with UFS filesystems
-# ------------------------------------------------------------------------
+# Sample df -k output from FreeBSD
+# --------------------------------
 # Filesystem  1K-blocks        Used     Avail Capacity  Mounted on
 # /dev/ad2s1a    1012974      37346    894592     4%    /
 # devfs                1          1         0   100%    /dev
@@ -167,8 +172,11 @@ use Getopt::Long;			#allow --long-switches to be used as parameters
 # declare variables
 my ($OK,$WARN,$CRITICAL,$UNKNOWN);
 my ($df,$CHECK_NAME,$default_warn_threshold,$default_critical_threshold);
-my ($warn_threshold_pct,$warn_threshold_bytes,$critical_threshold_pct,$critical_threshold_bytes);
-my ($total_size_bytes,$free_size_bytes,$warn_threshold,$critical_threshold,$pct_used,$pct_free);
+my ($warn_threshold_pct_free,$warn_threshold_bytes_free,$critical_threshold_pct_free,$critical_threshold_bytes_free);
+my ($warn_threshold_pct_used,$warn_threshold_bytes_used,$critical_threshold_pct_used,$critical_threshold_bytes_used);
+my ($total_size_bytes,$free_size_bytes,$pct_used,$pct_free);
+my ($warn_threshold_free,$critical_threshold_free);
+my ($warn_threshold_used,$critical_threshold_used);
 my ($filesystem,$inodes,$pct_inodes,$nagios_return_code,$uname);
 my ($opt_h,$opt_w,$opt_c);
 my ($os,$size_descriptor,$total_size_descriptor,$used_size_descriptor,$free_size_descriptor);
@@ -210,17 +218,17 @@ sub get_options {
    # If the user did not supply a --warn= threshold, use the default.
    #
    if( defined( $opt_w ) ) {
-      $warn_threshold = $opt_w;
+      $warn_threshold_free = $opt_w;
    } else {
-      $warn_threshold = $default_warn_threshold;
+      $warn_threshold_free = $default_warn_threshold;
    }
    #
    # If the user did not supply a --critical= threshold, use the default.
    #
    if( defined( $opt_c ) ) {
-      $critical_threshold = $opt_c;
+      $critical_threshold_free = $opt_c;
    } else {
-      $critical_threshold = $default_critical_threshold;
+      $critical_threshold_free = $default_critical_threshold;
    }
 }			#end of subroutine
 
@@ -446,73 +454,73 @@ sub check_thresholds {
    print "running check_thresholds subroutine \n" if ($verbose eq "yes");
    #
    # if the threshold does not have %/K/M/G/T/P specified, assume the value is in %
-   if ( $warn_threshold =~ /[0-9]+$/ ) {						#threshold was just a bare number - assume it was percent
+   if ( $warn_threshold_free =~ /[0-9]+$/ ) {							#threshold was just a bare number - assume it was percent
       print "Threshold parameter did not specify % K M G T P - assuming value is in percent \n" if ($verbose eq "yes");
-      $warn_threshold_pct   = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * $total_size_bytes / 100;			#convert percent to bytes
-      $warn_threshold_bytes = sprintf( "%.0f", $warn_threshold_bytes);			#get rid of any decimal places
-   }											#end of if block
+      $warn_threshold_pct_free   = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * $total_size_bytes / 100;		#convert percent to bytes
+      $warn_threshold_bytes_free = sprintf( "%.0f", $warn_threshold_bytes_free);		#get rid of any decimal places
+   }												#end of if block
    #
    # if the threshold is specified in percent, calculate the equivalent bytes
-   if ( $warn_threshold =~ /\%$/ ) {							#threshold was specified in percent
-      chop $warn_threshold;								#remove the final character
-      $warn_threshold_pct   = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * $total_size_bytes / 100;			#convert percent to bytes
-      $warn_threshold_bytes = sprintf( "%.0f", $warn_threshold_bytes);			#get rid of any decimal places
-   }											#end of if block
+   if ( $warn_threshold_free =~ /\%$/ ) {							#threshold was specified in percent
+      chop $warn_threshold_free;								#remove the final character
+      $warn_threshold_pct_free   = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * $total_size_bytes / 100;		#convert percent to bytes
+      $warn_threshold_bytes_free = sprintf( "%.0f", $warn_threshold_bytes_free);		#get rid of any decimal places
+   }												#end of if block
    #
    # if the threshold is specified in Kilobytes, calculate the equivalent percent and bytes
-   if ( $warn_threshold =~ /K$/i ) {							#threshold was specified in KB 
-      chop $warn_threshold;								#remove the final character
-      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * 1024;					#convert KB to bytes
-      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert KB to %
-      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
-   }											#end of if block
+   if ( $warn_threshold_free =~ /K$/i ) {							#threshold was specified in KB 
+      chop $warn_threshold_free;								#remove the final character
+      $warn_threshold_bytes_free = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * 1024;					#convert KB to bytes
+      $warn_threshold_pct_free   = $warn_threshold_bytes_free / $total_size_bytes *100;		#convert KB to %
+      $warn_threshold_pct_free   = sprintf( "%.1f", $warn_threshold_pct_free);			#truncate to 1 decimal place
+   }												#end of if block
    #
    # if the threshold is specified in Megabytes, calculate the equivalent percent
-   if ( $warn_threshold =~ /M$/i ) {							#threshold was specified in MB 
-      chop $warn_threshold;								#remove the final character
-      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * 1024 * 1024;				#convert MB to bytes
-      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert GB to %
-      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
-   }											#end of if block
+   if ( $warn_threshold_free =~ /M$/i ) {							#threshold was specified in MB 
+      chop $warn_threshold_free;								#remove the final character
+      $warn_threshold_bytes_free = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * 1024 * 1024;				#convert MB to bytes
+      $warn_threshold_pct_free   = $warn_threshold_bytes_free / $total_size_bytes *100;		#convert GB to %
+      $warn_threshold_pct_free   = sprintf( "%.1f", $warn_threshold_pct_free);			#truncate to 1 decimal place
+   }												#end of if block
    #
    # if the threshold is specified in Gigabytes, calculate the equivalent percent and bytes
-   if ( $warn_threshold =~ /G$/i ) {							#threshold was specified in GB 
-      chop $warn_threshold;								#remove the final character
-      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * 1024 * 1024 * 1024;			#convert GB to bytes
-      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert GB to %
-      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
-   }											#end of if block
+   if ( $warn_threshold_free =~ /G$/i ) {							#threshold was specified in GB 
+      chop $warn_threshold_free;								#remove the final character
+      $warn_threshold_bytes_free = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * 1024 * 1024 * 1024;			#convert GB to bytes
+      $warn_threshold_pct_free   = $warn_threshold_bytes_free / $total_size_bytes *100;		#convert GB to %
+      $warn_threshold_pct_free   = sprintf( "%.1f", $warn_threshold_pct_free);			#truncate to 1 decimal place
+   }												#end of if block
    #
    # if the threshold is specified in Terabytes, calculate the equivalent percent and bytes
-   if ( $warn_threshold =~ /P$/i ) {							#threshold was specified in TB 
-      chop $warn_threshold;								#remove the final character
-      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * 1024 * 1024 * 1024 * 1024;		#convert TB to bytes
-      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert TB to %
-      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
-   }											#end of if block
+   if ( $warn_threshold_free =~ /P$/i ) {							#threshold was specified in TB 
+      chop $warn_threshold_free;								#remove the final character
+      $warn_threshold_bytes_free = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * 1024 * 1024 * 1024 * 1024;		#convert TB to bytes
+      $warn_threshold_pct_free   = $warn_threshold_bytes_free / $total_size_bytes *100;		#convert TB to %
+      $warn_threshold_pct_free   = sprintf( "%.1f", $warn_threshold_pct_free);			#truncate to 1 decimal place
+   }												#end of if block
    #
    # if the threshold is specified in Petabytes, calculate the equivalent percent and bytes
-   if ( $warn_threshold =~ /P$/i ) {							#threshold was specified in PB 
-      chop $warn_threshold;								#remove the final character
-      $warn_threshold_bytes = $warn_threshold;						#save to new variable after removing final character
-      $warn_threshold_bytes = $warn_threshold * 1024 * 1024 * 1024 * 1024 * 1024;	#convert PB to bytes
-      $warn_threshold_pct   = $warn_threshold_bytes / $total_size_bytes * 100;		#convert PB to %
-      $warn_threshold_pct   = sprintf( "%.1f", $warn_threshold_pct);			#truncate to 1 decimal place
-   }											#end of if block
+   if ( $warn_threshold_free =~ /P$/i ) {							#threshold was specified in PB 
+      chop $warn_threshold_free;								#remove the final character
+      $warn_threshold_bytes_free = $warn_threshold_free;					#save to new variable after removing final character
+      $warn_threshold_bytes_free = $warn_threshold_free * 1024 * 1024 * 1024 * 1024 * 1024;	#convert PB to bytes
+      $warn_threshold_pct_free   = $warn_threshold_bytes_free / $total_size_bytes *100;		#convert PB to %
+      $warn_threshold_pct_free   = sprintf( "%.1f", $warn_threshold_pct_free);			#truncate to 1 decimal place
+   }												#end of if block
    #
    # now that we are certain the threshold is in %, confirm it is between 1-100.
    #
-   if( $warn_threshold_pct < 0 || $warn_threshold_pct > 100 ) {
+   if( $warn_threshold_pct_free < 0 || $warn_threshold_pct_free > 100 ) {
        print "$CHECK_NAME Unknown - Warn threshold must be between 0 - 100 when specified in percent\n";
        exit( $UNKNOWN );
    }
-   print "warn_threshold_bytes = $warn_threshold_bytes \n" if ($verbose eq "yes");
+   print "warn_threshold_bytes_free = $warn_threshold_bytes_free \n" if ($verbose eq "yes");
    #
    #
    #
@@ -520,68 +528,68 @@ sub check_thresholds {
    #
    #
    # if the threshold does not have %/K/M/G/T/P specified, assume the value is in %
-   if ( $critical_threshold =~ /[0-9]+$/ ) {						#threshold was just a bare number - assume it was percent
+   if ( $critical_threshold_free =~ /[0-9]+$/ ) {							#threshold was just a bare number - assume it was percent
       print "Threshold parameter did not specify % K M G T P - assuming value is in percent \n" if ($verbose eq "yes");
-      $critical_threshold_pct   = $critical_threshold;					#save to new variable after removing final character
-      $critical_threshold_bytes = $critical_threshold * $total_size_bytes / 100;	#convert percent to bytes 
-      $critical_threshold_bytes = sprintf( "%.0f", $critical_threshold_bytes);		#get rid of any decimal places 
-   }											#end of if block 
+      $critical_threshold_pct_free   = $critical_threshold_free;					#save to new variable after removing final character
+      $critical_threshold_bytes_free = $critical_threshold_free * $total_size_bytes / 100;		#convert percent to bytes 
+      $critical_threshold_bytes_free = sprintf( "%.0f", $critical_threshold_bytes_free);		#get rid of any decimal places 
+   }													#end of if block 
    # if the threshold is specified in percent, calculate the equivalent bytes 
-   if ( $critical_threshold =~ /\%$/ ) {                                    		#threshold was specified in percent 
-      chop $critical_threshold;								#remove the final character 
-      $critical_threshold_pct   = $critical_threshold;					#save to new variable after removing final character 
-      $critical_threshold_bytes = $critical_threshold * $total_size_bytes / 100;      	#convert percent to bytes 
-      $critical_threshold_bytes = sprintf( "%.0f", $critical_threshold_bytes);  	#get rid of any decimal places 
-   }                                                                    		#end of if block
+   if ( $critical_threshold_free =~ /\%$/ ) {                                    			#threshold was specified in percent 
+      chop $critical_threshold_free;									#remove the final character 
+      $critical_threshold_pct_free   = $critical_threshold_free;					#save to new variable after removing final character 
+      $critical_threshold_bytes_free = $critical_threshold_free * $total_size_bytes / 100;     		#convert percent to bytes 
+      $critical_threshold_bytes_free = sprintf( "%.0f", $critical_threshold_bytes_free);  		#get rid of any decimal places 
+   }                                                                    				#end of if block
    #
    # if the threshold is specified in Kilobytes, calculate the equivalent percent and bytes
-   if ( $critical_threshold =~ /K$/i ) {                                    		#threshold was specified in KB
-      chop $critical_threshold;								#remove the final character
-      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
-      $critical_threshold_bytes = $critical_threshold * 1024;				#convert KB to bytes
-      $critical_threshold_pct   = $critical_threshold_bytes / $total_size_bytes * 100; 	#convert KB to %
-      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
-   }                                                                    		#end of if block
+   if ( $critical_threshold_free =~ /K$/i ) {                                    			#threshold was specified in KB
+      chop $critical_threshold_free;									#remove the final character
+      $critical_threshold_bytes_free = $critical_threshold_free;					#save to new variable after removing final character
+      $critical_threshold_bytes_free = $critical_threshold_free * 1024;					#convert KB to bytes
+      $critical_threshold_pct_free   = $critical_threshold_bytes_free / $total_size_bytes * 100; 	#convert KB to %
+      $critical_threshold_pct_free   = sprintf( "%.1f", $critical_threshold_pct_free);			#truncate to 1 decimal place
+   }                                                                    				#end of if block
    #
    # if the threshold is specified in Megabytes, calculate the equivalent percent and bytes
-   if ( $critical_threshold =~ /M$/i ) {                                    		#threshold was specified in MB
-      chop $critical_threshold;								#remove the final character
-      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
-      $critical_threshold_bytes = $critical_threshold * 1024 * 1024;                 	#convert MB to bytes
-      $critical_threshold_pct = $critical_threshold_bytes / $total_size_bytes * 100;   	#convert MB to %
-      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
-   }                                                                    		#end of if block
+   if ( $critical_threshold_free =~ /M$/i ) {                                    			#threshold was specified in MB
+      chop $critical_threshold_free;									#remove the final character
+      $critical_threshold_bytes_free = $critical_threshold_free;					#save to new variable after removing final character
+      $critical_threshold_bytes_free = $critical_threshold_free * 1024 * 1024;                 		#convert MB to bytes
+      $critical_threshold_pct_free = $critical_threshold_bytes_free / $total_size_bytes * 100;   	#convert MB to %
+      $critical_threshold_pct_free   = sprintf( "%.1f", $critical_threshold_pct_free);			#truncate to 1 decimal place
+   }                                                                    				#end of if block
    #
    # if the threshold is specified in Gigabytes, calculate the equivalent percent and bytes
-   if ( $critical_threshold =~ /G$/i ) {                                    		#threshold was specified in GB
-      chop $critical_threshold;								#remove the final character
-      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
-      $critical_threshold_bytes = $critical_threshold * 1024 * 1024 * 1024;           	#convert GB to bytes
-      $critical_threshold_pct   = $critical_threshold_bytes / $total_size_bytes * 100; 	#convert GB to %
-      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
-   }                                                                    		#end of if block
+   if ( $critical_threshold_free =~ /G$/i ) {                                    			#threshold was specified in GB
+      chop $critical_threshold_free;									#remove the final character
+      $critical_threshold_bytes_free = $critical_threshold_free;					#save to new variable after removing final character
+      $critical_threshold_bytes_free = $critical_threshold_free * 1024 * 1024 * 1024;          		#convert GB to bytes
+      $critical_threshold_pct_free   = $critical_threshold_bytes_free / $total_size_bytes * 100; 	#convert GB to %
+      $critical_threshold_pct_free   = sprintf( "%.1f", $critical_threshold_pct_free);			#truncate to 1 decimal place
+   }                                                                    				#end of if block
    #
    # if the threshold is specified in Terabytes, calculate the equivalent percent and bytes
-   if ( $critical_threshold =~ /P$/i ) {                                    		#threshold was specified in TB
-      chop $critical_threshold;								#remove the final character
-      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
-      $critical_threshold_bytes = $critical_threshold * 1024 * 1024 * 1024 * 1024;	#convert TB to bytes
-      $critical_threshold_pct   = $critical_threshold / $total_size_bytes * 100;       	#convert TB to %
-      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
-   }                                                                    		#end of if block
+   if ( $critical_threshold_free =~ /P$/i ) {                                    			#threshold was specified in TB
+      chop $critical_threshold_free;									#remove the final character
+      $critical_threshold_bytes_free = $critical_threshold_free;					#save to new variable after removing final character
+      $critical_threshold_bytes_free = $critical_threshold_free * 1024 * 1024 * 1024 * 1024;		#convert TB to bytes
+      $critical_threshold_pct_free   = $critical_threshold_bytes_free / $total_size_bytes * 100;       	#convert TB to %
+      $critical_threshold_pct_free   = sprintf( "%.1f", $critical_threshold_pct_free);			#truncate to 1 decimal place
+   }                                                                    				#end of if block
    #
    # if the threshold is specified in Petabytes, calculate the equivalent percent and bytes
-   if ( $critical_threshold =~ /P$/i ) {                                    		#threshold was specified in PB
-      chop $critical_threshold;								#remove the final character
-      $critical_threshold_bytes = $critical_threshold;					#save to new variable after removing final character
-      $critical_threshold_bytes = $critical_threshold * 1024 * 1024 * 1024 * 1024 * 1024;	#convert PB to bytes
-      $critical_threshold_pct   = $critical_threshold / $total_size_bytes * 100;       	#convert PB to %
-      $critical_threshold_pct   = sprintf( "%.1f", $critical_threshold_pct);		#truncate to 1 decimal place
-   }                                                                    		#end of if block
+   if ( $critical_threshold_free =~ /P$/i ) {                                    			#threshold was specified in PB
+      chop $critical_threshold_free;									#remove the final character
+      $critical_threshold_bytes_free = $critical_threshold_free;					#save to new variable after removing final character
+      $critical_threshold_bytes_free = $critical_threshold_free * 1024 * 1024 * 1024 * 1024 * 1024;	#convert PB to bytes
+      $critical_threshold_pct_free   = $critical_threshold_bytes_free / $total_size_bytes * 100;	#convert PB to %
+      $critical_threshold_pct_free   = sprintf( "%.1f", $critical_threshold_pct_free);			#truncate to 1 decimal place
+   }                                                                    				#end of if block
    #
    # now that we are certain the threshold is in %, confirm it is between 1-100.
    #
-   if( $critical_threshold_pct < 0 || $critical_threshold_pct > 100 ) {
+   if( $critical_threshold_pct_free < 0 || $critical_threshold_pct_free > 100 ) {
        print "$CHECK_NAME Unknown - critical threshold must be between 0 - 100 when specified in percent\n";
        exit( $UNKNOWN );
    }
@@ -589,11 +597,11 @@ sub check_thresholds {
    #
    # sanity check to confirm the critical threshold is a smaller value than the warning threshold
    #
-   if( $warn_threshold_bytes <= $critical_threshold_bytes ) {
-      print "$CHECK_NAME Unknown - Warning threshold $warn_threshold_pct% must be larger than Critical threshold $critical_threshold_pct%.  Please correct.\n";
+   if( $warn_threshold_bytes_free <= $critical_threshold_bytes_free ) {
+      print "$CHECK_NAME Unknown - Warning threshold $warn_threshold_pct_free% must be larger than Critical threshold $critical_threshold_pct_free%.  Please correct.\n";
       exit( $UNKNOWN );
    }
-   print "critical_threshold_bytes = $critical_threshold_bytes \n" if ($verbose eq "yes");
+   print "critical_threshold_bytes_free = $critical_threshold_bytes_free \n" if ($verbose eq "yes");
 }					#end of subroutine
 
 
@@ -609,96 +617,6 @@ sub format_output {
    #
    #
    print "running format_output subroutine \n" if ($verbose eq "yes");
-   #
-   #
-   # Convert bytes of warning/critical thresholds to KB/MB/GB/TB/PB
-   #
-   if    ( $warn_threshold_bytes >= 1000000000000000 ){
-      $warn_threshold_descriptor = "PB";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 / 1024 / 1024 / 1024 );
-   }
-   #
-   elsif ( $warn_threshold_bytes >= 1000000000000 ){
-      $warn_threshold_descriptor = "TB";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 / 1024 / 1024 );
-   }
-   #
-   elsif ( $warn_threshold_bytes >= 1000000000 ){
-      $warn_threshold_descriptor = "GB";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 / 1024 );
-   }
-   #
-   elsif ( $warn_threshold_bytes >= 1000000 ){
-      $warn_threshold_descriptor  = "MB";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 / 1024 );
-   }
-   #
-   elsif ( $warn_threshold_bytes >= 1000 ){
-      $warn_threshold_descriptor = "KB";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1024 );
-   }
-   #
-   elsif ( $warn_threshold_bytes >= 1 ){
-      $warn_threshold_descriptor = "B";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1 );
-   }
-   #
-   elsif ( $warn_threshold_bytes >= 0 ){  #just in case someone sets the threshold to zero
-      $warn_threshold_descriptor = "B";
-      $warn_threshold            = sprintf( "%.2f", $warn_threshold_bytes / 1 );
-   }
-   #
-   else {
-      print "$CHECK_NAME Unknown - could not determine size of warning threshold ";
-      exit $UNKNOWN;
-   }
-   #
-   #
-   #
-   if    ( $critical_threshold_bytes >= 1000000000000000 ){
-      $critical_threshold_descriptor = "PB";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 / 1024 / 1024 / 1024 );
-   }
-   #
-   elsif ( $critical_threshold_bytes >= 1000000000000 ){
-      $critical_threshold_descriptor = "TB";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 / 1024 / 1024 );
-   }
-   #
-   elsif ( $critical_threshold_bytes >= 1000000000 ){
-      $critical_threshold_descriptor = "GB";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 / 1024 );
-   }
-   #
-   elsif ( $critical_threshold_bytes >= 1000000 ){
-      $critical_threshold_descriptor = "MB";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 / 1024 );
-   }
-   #
-   elsif ( $critical_threshold_bytes >= 1000 ){
-      $critical_threshold_descriptor = "KB";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1024 );
-   }
-   #
-   elsif ( $critical_threshold_bytes >= 1 ){
-      $critical_threshold_descriptor = "B";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1 );
-   }
-   #
-   elsif ( $critical_threshold_bytes >= 0 ){  #just in case someone sets the threshold to zero
-      $critical_threshold_descriptor = "B";
-      $critical_threshold            = sprintf( "%.2f", $critical_threshold_bytes / 1 );
-   }
-   #
-   else {
-      print "$CHECK_NAME Unknown - could not determine size of critical threshold ";
-      exit $UNKNOWN;
-   }
-   #
-   #
-   #
-   #
-   #
    #
    # Convert bytes of total/free/used space to KB/MB/GB/TB/PB
    #
@@ -742,7 +660,105 @@ sub format_output {
       print "$CHECK_NAME Unknown - could not determine size of filesystem ";
       exit $UNKNOWN;
    }					#end of if/elsif/else block
-}
+   #
+   #
+   # Convert bytes of warning/critical thresholds to KB/MB/GB/TB/PB
+   #
+   if    ( $warn_threshold_bytes_free >= 1000000000000000 ){
+      $warn_threshold_descriptor = "PB";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1024 / 1024 / 1024 / 1024 / 1024 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $warn_threshold_bytes_free >= 1000000000000 ){
+      $warn_threshold_descriptor = "TB";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1024 / 1024 / 1024 / 1024 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $warn_threshold_bytes_free >= 1000000000 ){
+      $warn_threshold_descriptor = "GB";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1024 / 1024 / 1024 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $warn_threshold_bytes_free >= 1000000 ){
+      $warn_threshold_descriptor  = "MB";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1024 / 1024 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $warn_threshold_bytes_free >= 1000 ){
+      $warn_threshold_descriptor = "KB";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1024 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $warn_threshold_bytes_free >= 1 ){
+      $warn_threshold_descriptor = "B";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $warn_threshold_bytes_free >= 0 ){  #just in case someone sets the threshold to zero
+      $warn_threshold_descriptor = "B";
+      $warn_threshold_free       = sprintf( "%.2f", $warn_threshold_bytes_free / 1 );
+      $warn_threshold_used       = $total_size - $warn_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   else {
+      print "$CHECK_NAME Unknown - could not determine size of warning threshold ";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   #
+   if    ( $critical_threshold_bytes_free >= 1000000000000000 ){
+      $critical_threshold_descriptor = "PB";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1024 / 1024 / 1024 / 1024 / 1024 );
+   }
+   #
+   elsif ( $critical_threshold_bytes_free >= 1000000000000 ){
+      $critical_threshold_descriptor = "TB";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1024 / 1024 / 1024 / 1024 );
+      $critical_threshold_used       = $total_size - $critical_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $critical_threshold_bytes_free >= 1000000000 ){
+      $critical_threshold_descriptor = "GB";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1024 / 1024 / 1024 );
+      $critical_threshold_used       = $total_size - $critical_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $critical_threshold_bytes_free >= 1000000 ){
+      $critical_threshold_descriptor = "MB";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1024 / 1024 );
+      $critical_threshold_used       = $total_size - $critical_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $critical_threshold_bytes_free >= 1000 ){
+      $critical_threshold_descriptor = "KB";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1024 );
+      $critical_threshold_used       = $total_size - $critical_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $critical_threshold_bytes_free >= 1 ){
+      $critical_threshold_descriptor = "B";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1 );
+      $critical_threshold_used       = $total_size - $critical_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   elsif ( $critical_threshold_bytes_free >= 0 ){  #just in case someone sets the threshold to zero
+      $critical_threshold_descriptor = "B";
+      $critical_threshold_free       = sprintf( "%.2f", $critical_threshold_bytes_free / 1 );
+      $critical_threshold_used       = $total_size - $critical_threshold_free;  #this value is used in the perfdata output for creating graphs
+   }
+   #
+   else {
+      print "$CHECK_NAME Unknown - could not determine size of critical threshold ";
+      exit $UNKNOWN;
+   }
+}					#end of subroutine
 
 
 
@@ -761,14 +777,15 @@ sub print_output {
    # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
    # The format is:  label=value[UOM];[warn];[crit];[min];[max]
    # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
-   # You can have multiple items of perf data, just separate each section with a space
-   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
-   $perf_data = "total_size=${total_size}${size_descriptor} used_size=${used_size}${size_descriptor};;;; free_size=${free_size}${size_descriptor};;;; pct_free=${pct_free}%;${warn_threshold_pct};${critical_threshold_pct};0;100  ";
+   # You can have multiple items of perf data, just separate each section with a space.
+   # If you are pnp4nagios for graphing, each space-separated section will create a separate graph.
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes GB=gigabytes %=percent c=counter
+   $perf_data = "bytes_used=${used_size}${size_descriptor};${warn_threshold_used}${size_descriptor};${critical_threshold_used}${size_descriptor};0;${total_size}${size_descriptor} pct_used=${pct_used}%;;;0;100 ";
    #
    #
    #
    # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
-   $common_output_data = "$filesystem has ${free_size}${size_descriptor} (${pct_free}%) free space.  Total=${total_size}${size_descriptor} Used=${used_size}${size_descriptor} Free=${free_size}${size_descriptor} Warn at ${warn_threshold}${warn_threshold_descriptor} (${warn_threshold_pct}%) free, critical at ${critical_threshold}${critical_threshold_descriptor} (${critical_threshold_pct}%)";
+   $common_output_data = "$filesystem has ${free_size}${size_descriptor} (${pct_free}%) free space.  Total=${total_size}${size_descriptor} Used=${used_size}${size_descriptor} Free=${free_size}${size_descriptor}, Warn at ${warn_threshold_free}${warn_threshold_descriptor} (${warn_threshold_pct_free}%) free, Critical at ${critical_threshold_free}${critical_threshold_descriptor} (${critical_threshold_pct_free}%) free.";
    #
    #
    # We shouldn't (famous last words) need to worry about inodes anymore.  In case we are are on an
@@ -779,25 +796,24 @@ sub print_output {
       $perf_data          = "$perf_data inodes=$inodes;;;; pct_inodes=$pct_inodes;90%;99%;0%;100% ";
    }
 
-   #
    if( $total_size_bytes == 0 ) {
       print "$CHECK_NAME Unknown - $filesystem is a bad name or df can't find it";
       exit $UNKNOWN;
    }
 
-   if( $pct_free <= $critical_threshold_pct ) {
+   if( $pct_free <= $critical_threshold_pct_free ) {
       $crit_output_data = "Filesystem is critically low on free space.  Please free up space by deleting obsolete data or have the filesystem grown in size.  Please do not ignore this warning.  You will continue to receive this warning every day until the low disk space issue is addressed. ";
       print "$CHECK_NAME CRITICAL -  $common_output_data $crit_output_data | $perf_data \n";
       exit $CRITICAL;
    }
 
-   if( $pct_free <= $warn_threshold_pct ) {
+   if( $pct_free <= $warn_threshold_pct_free ) {
       $warn_output_data = "Filesystem is getting low on free space.  Please free up space by deleting obsolete data or have the filesystem grown in size.  Please do not ignore this warning.  You will continue to receive this warning every day until the low disk space issue is addressed. ";
       print "$CHECK_NAME WARN     - $common_output_data $warn_output_data | $perf_data \n";
       exit $WARN;
    }
 
-   if( $pct_free > $warn_threshold_pct ) {
+   if( $pct_free > $warn_threshold_pct_free ) {
       print "$CHECK_NAME OK       - $common_output_data | $perf_data \n";
       exit $OK;
    }
@@ -824,5 +840,4 @@ get_filesystem_size;
 check_thresholds;	
 format_output;
 print_output;	
-
 
