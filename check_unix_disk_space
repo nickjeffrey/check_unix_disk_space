@@ -34,7 +34,7 @@
 #  2018-07-09   njeffrey    	Bug fix - remove % from thresholds in performance data in print_output subroutine
 #  2022-04-13   njeffrey    	Code refactoring
 #  2022-04-14   njeffrey    	Adjust perfdata output to include warn,crit thresholds to format expected by pnp4nagios graphing
-#  2022-09-23   njeffrey    	Tweak performance data output
+#  2022-08-23   njeffrey    	Tweak performance data output
 
 
 
