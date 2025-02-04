@@ -14,7 +14,7 @@ This assumes that you already have ssh key pairs configured.
             use                             generic-24x7-service
             host_name                       unix11
             service_description             Disk /var/log free space check
-            check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_aix_disk_space --warn=10 --critical=5 /var/log"
+            check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_disk_space --warn=10 --critical=5 /var/log"
             }
     
 
